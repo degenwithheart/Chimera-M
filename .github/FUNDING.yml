@@ -1,0 +1,9 @@
+# CHIMERA-M Funding & Support Options
+# Enable sponsor button on repository
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/managing-repository-metadata-with-a-README-file#about-funding-files
+
+github: degenwithheart
+custom:
+# - "https://thanks.dev/gh/degenwithheart"
+# - "https://buymeacoffee.com/degenwithheart"
+  - "https://www.dial.to/?action=solana-action:https://action.solscan.io/api/donate?receiver=6o1iE4cKQcjW4UFd4vn35r43qD9LjNDhPGNUMBuS8ocZ"
