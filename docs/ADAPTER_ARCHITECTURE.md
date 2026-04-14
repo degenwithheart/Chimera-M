@@ -11,7 +11,7 @@
 CHIMERA-M will support both **full fine-tuning** (current) and **adapter-based training** (LoRA/QLoRA). The adapter mode reduces trainable parameters by 1000× while maintaining most model quality, making it ideal for consumer GPUs.
 
 **Key insight:** Adapters are a *better* fit for CHIMERA-M's gearshift system than full fine-tuning because:
-- Sm optimizer state → faster gear transitions
+- Small optimizer state → faster gear transitions
 - Natural sparsity → better compression ratios
 - Per-layer importance → fine-grained gear assignment
 

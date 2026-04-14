@@ -64,22 +64,23 @@ void cms_update(
     float beta2,
     int step_count
 ) {
-    // Bias correction (Adam-style)
-    float bias_correction1 = 1.0f - powf(beta1, (float)step_count);
-    float bias_correction2 = 1.0f - powf(beta2, (float)step_count);
+    // NOTE: Bias correction is applied at QUERY time, not UPDATE time
+    // This matches the Python implementation behavior
+    // step_count parameter kept for API compatibility but not used
+    (void)step_count;  // Suppress unused parameter warning
     
-    // Update each index
+    // Update each index with raw EMA (bias correction deferred to query)
     for (int i = 0; i < n; i++) {
         uint32_t idx = (uint32_t)indices[i];
-        float m_val = values_m[i] / bias_correction1;
-        float v_val = values_v[i] / bias_correction2;
+        float m_val = values_m[i];  // Raw momentum, no bias correction
+        float v_val = values_v[i];  // Raw variance, no bias correction
         
         // Update each hash row
         for (int d = 0; d < depth; d++) {
             uint32_t bucket = hash_index(idx, seeds[d], width);
             size_t offset = d * width + bucket;
             
-            // Adam-style EMA update
+            // Pure EMA update (bias correction applied at query time)
             tables_m[offset] = beta1 * tables_m[offset] + (1.0f - beta1) * m_val;
             tables_v[offset] = beta2 * tables_v[offset] + (1.0f - beta2) * v_val;
         }
@@ -131,8 +132,10 @@ void cms_query(
             if (v_val < min_v) min_v = v_val;
         }
         
-        out_m[i] = min_m;
-        out_v[i] = min_v;
+        // Safety check: if no valid value found (all INFINITY), return 0
+        // This prevents NaN propagation in Adam optimizer when tables are empty
+        out_m[i] = (min_m == INFINITY) ? 0.0f : min_m;
+        out_v[i] = (min_v == INFINITY) ? 0.0f : min_v;
     }
 }
 
@@ -154,17 +157,18 @@ void cms_update_batch_optimized(
     float beta2,
     int step_count
 ) {
-    // Bias correction
-    float bias_correction1 = 1.0f - powf(beta1, (float)step_count);
-    float bias_correction2 = 1.0f - powf(beta2, (float)step_count);
+    // NOTE: Bias correction is applied at QUERY time, not UPDATE time
+    // This matches the Python implementation behavior
+    (void)step_count;  // Suppress unused parameter warning
     
-    // Pre-compute bias-corrected values
-    float* corrected_m = (float*)malloc(n * sizeof(float));
-    float* corrected_v = (float*)malloc(n * sizeof(float));
+    // Use raw values directly (bias correction deferred to query)
+    // Pre-allocate for cache-friendly access
+    float* raw_m = (float*)malloc(n * sizeof(float));
+    float* raw_v = (float*)malloc(n * sizeof(float));
     
     for (int i = 0; i < n; i++) {
-        corrected_m[i] = values_m[i] / bias_correction1;
-        corrected_v[i] = values_v[i] / bias_correction2;
+        raw_m[i] = values_m[i];  // No bias correction
+        raw_v[i] = values_v[i];  // No bias correction
     }
     
     // Update row by row for better cache locality
@@ -176,13 +180,14 @@ void cms_update_batch_optimized(
         for (int i = 0; i < n; i++) {
             uint32_t bucket = hash_index(indices[i], seed, width);
             
-            row_m[bucket] = beta1 * row_m[bucket] + (1.0f - beta1) * corrected_m[i];
-            row_v[bucket] = beta2 * row_v[bucket] + (1.0f - beta2) * corrected_v[i];
+            // Pure EMA update (bias correction at query time)
+            row_m[bucket] = beta1 * row_m[bucket] + (1.0f - beta1) * raw_m[i];
+            row_v[bucket] = beta2 * row_v[bucket] + (1.0f - beta2) * raw_v[i];
         }
     }
     
-    free(corrected_m);
-    free(corrected_v);
+    free(raw_m);
+    free(raw_v);
 }
 
 /*

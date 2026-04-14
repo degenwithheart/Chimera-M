@@ -30,8 +30,9 @@ See **[Usage Guide](docs/USAGE.md)** for detailed setup, installation, and workf
 | **[Usage Guide](docs/USAGE.md)** | Installation, setup, running training, workflows |
 | **[Troubleshooting](docs/TROUBLESHOOTING.md)** | Common issues and fixes |
 | **[C/C++ Extensions](chimera_m_cpp/README.md)** | Optional acceleration extensions (10-100× speedup) |
-| **[Adapter Architecture](docs/ADAPTER_ARCHITECTURE.md)** | *Roadmap: LoRA/QLoRA/Unsloth integration design* |
-| **[Multi-GPU Architecture](docs/MULTI_GPU_ARCHITECTURE.md)** | *Roadmap: Future distributed training design* |
+| **[Adapter Architecture](docs/ADAPTER_ARCHITECTURE.md)** | *Roadmap v1.2: LoRA/QLoRA/Unsloth integration design* |
+| **[TriAttention Architecture](docs/TRIATTENTION_ARCHITECTURE.md)** | *Roadmap v1.3: KV cache compression for inference* |
+| **[Multi-GPU Architecture](docs/MULTI_GPU_ARCHITECTURE.md)** | *Roadmap v1.4+: Future distributed training design* |
 
 ## Project Structure
 
@@ -81,7 +82,10 @@ python train.py --resume ./Output/checkpoint_epoch5.pt
 - **Future v1.2**: LoRA/QLoRA adapter support with per-layer gear assignment
   - *Status: Architecture drafted, pending implementation*
   - See [Adapter Architecture](docs/ADAPTER_ARCHITECTURE.md) for design
-- **Future v1.3+**: Multi-GPU distributed training with asymmetric gear assignment
+- **Future v1.3**: TriAttention KV cache compression for unified training+inference
+  - *Status: Architecture drafted, pending implementation*
+  - See [TriAttention Architecture](docs/TRIATTENTION_ARCHITECTURE.md) for design
+- **Future v1.4+**: Multi-GPU distributed training with asymmetric gear assignment
   - *Status: Architecture drafted, pending efficient communication solutions*
   - See [Multi-GPU Architecture](docs/MULTI_GPU_ARCHITECTURE.md) for design
 

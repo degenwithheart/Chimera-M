@@ -134,7 +134,7 @@ All configuration options and gear level details.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `poll_interval` | 100ms | Watchdog check frequency |
-| `upsift_hysteresis` | 0.15 | VRAM % below threshold to upshift |
+| `upshift_hysteresis` | 0.15 | VRAM % below threshold to upshift |
 | `pressure_weight_vram` | 0.4 | VRAM contribution to pressure score |
 | `pressure_weight_loss` | 0.3 | Loss trend contribution |
 | `pressure_weight_variance` | 0.2 | Step time variance contribution |

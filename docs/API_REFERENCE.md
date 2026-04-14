@@ -293,8 +293,8 @@ Save state.
 #### `load_state_dict(state_dict)`
 Restore state.
 
-#### `apply_gear_compression(new_gear)`
-Change compression level.
+#### `_apply_gear_compression(new_gear)` (internal)
+Change compression level. This is an internal method used by the gearshift watchdog.
 
 **Creates checkpoints:**
 - `gear_transition_step{N}_pre.pt`

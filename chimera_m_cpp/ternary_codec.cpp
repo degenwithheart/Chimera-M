@@ -167,12 +167,20 @@ py::array_t<float> ternary_unpack(
             int code = (packed_val >> (i * 2)) & 0b11;
             
             // Convert code {-1, 0, +1} -> {0, 1, 2}
+            // Code 3 (0b11) is unused - indicates data corruption
             float val;
             switch (code) {
                 case 0: val = -1.0f; break;
                 case 1: val = 0.0f; break;
                 case 2: val = 1.0f; break;
-                default: val = 0.0f; break;  // Should not happen
+                case 3:  // Invalid code - data corruption detected
+                    throw std::runtime_error(
+                        "Corrupted ternary data: invalid code 0b11 at position " + 
+                        std::to_string(idx)
+                    );
+                default: 
+                    val = 0.0f;  // Fallback for any other unexpected value
+                    break;
             }
             
             w[idx] = val * scale;

@@ -10,7 +10,7 @@ Single-file training system with autonomous compression gearshift. All core algo
 
 ```
 chimera-m/
-├── chimera_m.py      # Core system (~2300 lines, self-contained)
+├── chimera_m.py      # Core system (~3000 lines, self-contained)
 ├── train.py          # 4-line entry point
 ├── requirements.txt  # 5 dependencies
 ├── docs/             # 6 documentation files

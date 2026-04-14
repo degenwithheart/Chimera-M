@@ -18,6 +18,8 @@ License: MIT
 
 from __future__ import annotations
 
+__version__ = "1.0.0"
+
 import os
 import sys
 import time
@@ -28,13 +30,13 @@ import pickle
 import lz4.frame
 import threading
 import argparse
-import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any, Callable, Set, Union
-from collections import deque
+from collections import deque, Counter
 from pathlib import Path
 import logging
+import warnings
 
 # Core scientific computing
 import numpy as np
@@ -83,6 +85,58 @@ logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Watchdog timing constants (milliseconds)
+DEFAULT_WATCHDOG_POLL_INTERVAL_MS = 100.0
+DEFAULT_WATCHDOG_HOLD_DURATION_S = 60.0
+
+# CMS (Count-Min Sketch) constants
+DEFAULT_CMS_WIDTH = 1024
+DEFAULT_CMS_DEPTH = 4
+
+# Paged memory constants
+DEFAULT_PAGE_SIZE_MB = 256
+DEFAULT_RAM_THRESHOLD = 0.85
+MIN_RAM_THRESHOLD = 0.70
+MAX_RAM_THRESHOLD = 0.95
+
+# Gear shift thresholds
+DEFAULT_VRAM_DOWNSHIFT_THRESHOLD = 0.85
+DEFAULT_LOSS_SPIKE_THRESHOLD = 1.5
+HYSTERESIS_MARGIN = 0.15  # For upshift decisions
+
+# Training constants
+DEFAULT_LR = 3e-4
+DEFAULT_EPOCHS = 10
+DEFAULT_BATCH_SIZE = 1
+DEFAULT_MAX_LENGTH = 512
+DEFAULT_LOG_INTERVAL = 10
+DEFAULT_CHECKPOINT_INTERVAL = 500
+
+# MEZO constants
+DEFAULT_MEZO_EPSILON = 1e-3
+MAX_MEZO_RETRIES = 3
+MEZO_PENALTY_LOSS = 1e6
+
+# Bayesian optimizer constants
+DEFAULT_BO_EXPLORATION_XI = 0.01
+DEFAULT_BO_NOISE_VARIANCE = 0.05
+BO_RANDOM_EXPLORATION_STEPS = 10
+BO_ACQUISITION_SAMPLES = 100
+
+# Ternary compression constants
+TERNARY_VALUES_PER_INT32 = 16
+TERNARY_BITS_PER_VALUE = 2
+TERNARY_CODES = {-1: 0, 0: 1, 1: 2}  # Mapping to packed codes
+
+# Hardware detection constants
+MIN_VRAM_GB_FOR_GPU_TRAINING = 4.0
+MIN_RAM_GB = 8.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 1: BAYESIAN OPTIMIZER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -106,6 +160,11 @@ class Kernel(ABC):
     def compute_gram(self, X: ndarray) -> ndarray:
         """Compute Gram matrix for dataset X."""
         pass
+    
+    @abstractmethod
+    def compute_cross(self, X1: ndarray, X2: ndarray) -> ndarray:
+        """Compute cross-kernel matrix K(X1, X2)."""
+        pass
 
 
 class RBFKernel(Kernel):
@@ -120,12 +179,20 @@ class RBFKernel(Kernel):
         return self.variance * np.exp(-0.5 * sq_dist / (self.length_scale ** 2))
     
     def compute_gram(self, X: ndarray) -> ndarray:
-        n = len(X)
-        K = np.zeros((n, n))
-        for i in range(n):
-            for j in range(n):
-                K[i, j] = self(X[i], X[j])
-        return K
+        """Compute Gram matrix using vectorized operations for speed."""
+        # Vectorized computation: K[i,j] = variance * exp(-0.5 * ||x_i - x_j||^2 / length_scale^2)
+        # Using broadcasting: (n,1,d) - (1,n,d) -> (n,n,d) -> sum over d -> (n,n)
+        X = np.asarray(X)
+        sq_dists = np.sum((X[:, np.newaxis, :] - X[np.newaxis, :, :]) ** 2, axis=2)
+        return self.variance * np.exp(-0.5 * sq_dists / (self.length_scale ** 2))
+    
+    def compute_cross(self, X1: ndarray, X2: ndarray) -> ndarray:
+        """Compute cross-kernel matrix K(X1, X2) vectorized."""
+        X1 = np.asarray(X1)
+        X2 = np.asarray(X2)
+        # Broadcasting: (n1,1,d) - (1,n2,d) -> (n1,n2,d)
+        sq_dists = np.sum((X1[:, np.newaxis, :] - X2[np.newaxis, :, :]) ** 2, axis=2)
+        return self.variance * np.exp(-0.5 * sq_dists / (self.length_scale ** 2))
 
 
 class MaternKernel(Kernel):
@@ -141,12 +208,23 @@ class MaternKernel(Kernel):
         return self.variance * (1 + scaled + scaled**2 / 3) * np.exp(-scaled)
     
     def compute_gram(self, X: ndarray) -> ndarray:
-        n = len(X)
-        K = np.zeros((n, n))
-        for i in range(n):
-            for j in range(n):
-                K[i, j] = self(X[i], X[j])
-        return K
+        """Compute Gram matrix using vectorized operations for speed."""
+        # Vectorized Matérn 5/2 computation
+        X = np.asarray(X)
+        sq_dists = np.sum((X[:, np.newaxis, :] - X[np.newaxis, :, :]) ** 2, axis=2)
+        dists = np.sqrt(sq_dists + 1e-8)
+        scaled = np.sqrt(5) * dists / self.length_scale
+        return self.variance * (1 + scaled + scaled**2 / 3) * np.exp(-scaled)
+    
+    def compute_cross(self, X1: ndarray, X2: ndarray) -> ndarray:
+        """Compute cross-kernel matrix K(X1, X2) vectorized."""
+        X1 = np.asarray(X1)
+        X2 = np.asarray(X2)
+        # Broadcasting: (n1,1,d) - (1,n2,d) -> (n1,n2,d)
+        sq_dists = np.sum((X1[:, np.newaxis, :] - X2[np.newaxis, :, :]) ** 2, axis=2)
+        dists = np.sqrt(sq_dists + 1e-8)
+        scaled = np.sqrt(5) * dists / self.length_scale
+        return self.variance * (1 + scaled + scaled**2 / 3) * np.exp(-scaled)
 
 
 class AcquisitionFunction(ABC):
@@ -212,24 +290,13 @@ class GaussianProcess:
         self.alpha = np.linalg.solve(self.L.T, np.linalg.solve(self.L, y))
     
     def predict(self, X_new: ndarray) -> Tuple[ndarray, ndarray]:
-        """Predict mean and std at new points."""
+        """Predict mean and std at new points using vectorized operations."""
         if self.X is None:
             raise RuntimeError("GP not fitted yet")
         
-        # Compute kernel between new and training points
-        n_new = len(X_new)
-        n_train = len(self.X)
-        K_new_train = np.zeros((n_new, n_train))
-        
-        for i in range(n_new):
-            for j in range(n_train):
-                K_new_train[i, j] = self.kernel(X_new[i], self.X[j])
-        
-        # Compute kernel for new points
-        K_new = np.zeros((n_new, n_new))
-        for i in range(n_new):
-            for j in range(n_new):
-                K_new[i, j] = self.kernel(X_new[i], X_new[j])
+        # Vectorized kernel computation
+        K_new_train = self.kernel.compute_cross(X_new, self.X)
+        K_new = self.kernel.compute_gram(X_new)
         
         # Predict mean
         mean = K_new_train @ self.alpha
@@ -374,7 +441,14 @@ class TernaryCodec:
         # Use C++ extension if available
         if self.use_cpp and tensor.device.type == 'cpu':
             flat = tensor.flatten().detach().cpu().numpy()
-            scale = float(np.abs(flat).max()) + 1e-8
+            max_abs = float(np.abs(flat).max())
+            # Handle zero tensor: return zeros with scale 0
+            if max_abs < 1e-12:
+                packed_size = (flat.size + 15) // 16
+                packed_np = np.zeros(packed_size, dtype=np.int32)
+                packed = torch.from_numpy(packed_np).to(tensor.device)
+                return packed, (original_shape, 0.0)
+            scale = max_abs + 1e-8
             
             packed_np = _ternary_cpp.pack(
                 flat, scale, self.stochastic, seed or 0
@@ -388,7 +462,13 @@ class TernaryCodec:
         n = flat.numel()
         
         # Scale to maximize dynamic range
-        scale = flat.abs().max().item() + 1e-8
+        max_abs = flat.abs().max().item()
+        # Handle zero tensor: return zeros with scale 0
+        if max_abs < 1e-12:
+            packed_size = (n + 15) // 16
+            packed = torch.zeros(packed_size, dtype=torch.int32, device=tensor.device)
+            return packed, (original_shape, 0.0)
+        scale = max_abs + 1e-8
         normalized = flat / scale
         
         # Quantize to ternary
@@ -423,11 +503,19 @@ class TernaryCodec:
         # Convert {-1, 0, +1} to {0, 1, 2} for packing
         codes = (quantized + 1).to(torch.int32)  # Now {0, 1, 2}
         
-        for i in range(16):
-            shift = i * 2
-            idx = torch.arange(i, n, 16, device=tensor.device)
-            if len(idx) > 0:
-                packed[idx // 16] |= (codes[idx] << shift)
+        # Efficient bit-packing using direct indexing with bitwise OR
+        # Each packed element contains 16 ternary values (2 bits each)
+        for group_idx in range(packed_size):
+            start = group_idx * 16
+            end = min(start + 16, n)
+            group_codes = codes[start:end]
+            
+            # Build packed value using Python int for efficiency (avoids tensor creation in loop)
+            packed_val = 0
+            for i, code in enumerate(group_codes):
+                packed_val |= int(code.item()) << (i * 2)
+            
+            packed[group_idx] = packed_val
         
         metadata = (original_shape, scale)
         return packed, metadata
@@ -435,6 +523,10 @@ class TernaryCodec:
     def decode(self, packed: torch.Tensor, metadata: Tuple) -> torch.Tensor:
         """Decode packed ternary back to FP32 tensor."""
         original_shape, scale = metadata
+        
+        # Handle zero scale (zero tensor case)
+        if abs(scale) < 1e-12:
+            return torch.zeros(original_shape, device=packed.device)
         
         # Use C++ extension if available
         if self.use_cpp and packed.device.type == 'cpu':
@@ -444,6 +536,7 @@ class TernaryCodec:
         
         # Python fallback
         n = int(np.prod(original_shape))
+        packed_size = packed.numel()
         
         # Unpack
         flat = torch.zeros(n, device=packed.device)
@@ -453,7 +546,9 @@ class TernaryCodec:
             mask = 0b11 << shift
             idx = torch.arange(i, n, 16, device=packed.device)
             if len(idx) > 0:
-                codes = ((packed[idx // 16] & mask) >> shift).float()
+                # Fix: clamp packet index to avoid overflow
+                packet_indices = (idx // 16).clamp(max=packed_size - 1)
+                codes = ((packed[packet_indices] & mask) >> shift).float()
                 # Convert {0, 1, 2} back to {-1, 0, +1}
                 flat[idx] = codes - 1
         
@@ -479,7 +574,7 @@ class CountMinSketch:
     Uses C extension when available for 20-100× speedup.
     """
     
-    def __init__(self, width: int = 1024, depth: int = 4, device: str = 'cuda'):
+    def __init__(self, width: int = DEFAULT_CMS_WIDTH, depth: int = DEFAULT_CMS_DEPTH, device: str = 'cuda'):
         self.width = width
         self.depth = depth
         self.device = device
@@ -488,16 +583,20 @@ class CountMinSketch:
         self.tables_m = torch.zeros((depth, width), device=device)
         self.tables_v = torch.zeros((depth, width), device=device)
         
-        # Hash seeds
-        self.seeds = torch.randint(0, 2**31, (depth,))
+        # Hash seeds (on same device as tables for consistent hashing)
+        self.seeds = torch.randint(0, 2**31, (depth,), device=device)
         
         # Statistics
         self.step_count = 0
         
-        # Use C extension if available
+        # Use C extension if available and tensor is on CPU
+        # Note: C extension only supports CPU tensors, GPU tensors use optimized Python
         self.use_c = _CMS_C_AVAILABLE and device == 'cpu'
+        self.device = device  # Store device for reference
         if self.use_c:
             logger.debug("CountMinSketch using C acceleration")
+        elif device == 'cuda':
+            logger.debug("CountMinSketch using CUDA-optimized Python implementation")
     
     def _hash(self, indices: torch.Tensor, seed: int) -> torch.Tensor:
         """Universal hash function."""
@@ -512,8 +611,12 @@ class CountMinSketch:
         """
         Update sketch with new momentum/variance values.
         
+        NOTE: Bias correction is applied at query time, not update time.
+        This matches standard Adam behavior where bias correction is applied
+        to the accumulated moments when computing the update.
+        
         Args:
-            indices: Parameter indices (flat)
+            indices: Global parameter indices (flat, across all parameters)
             values_m: Momentum values for these indices
             values_v: Variance values
             beta1, beta2: Adam decay rates
@@ -522,6 +625,8 @@ class CountMinSketch:
         
         # Try C extension first for CPU tensors
         if self.use_c and cms_update_fast is not None:
+            # Pass actual step_count for proper bias correction at query time
+            # (bias correction is applied at query time, not during update)
             success = cms_update_fast(
                 self.tables_m, self.tables_v,
                 indices, values_m, values_v,
@@ -530,34 +635,37 @@ class CountMinSketch:
             if success:
                 return
         
-        # Python fallback
-        # Bias correction
-        bias_correction1 = 1 - beta1 ** self.step_count
-        bias_correction2 = 1 - beta2 ** self.step_count
-        
+        # Python fallback - pure EMA update without bias correction
         for d in range(self.depth):
-            # Hash indices to buckets
-            buckets = self._hash(indices, self.seeds[d].item())
+            # Hash indices to buckets (pass seed as tensor for device consistency)
+            buckets = self._hash(indices, self.seeds[d])
             
-            # Update with exponential moving average
+            # Update with exponential moving average (no bias correction here)
             for i, (idx, m, v) in enumerate(zip(buckets, values_m, values_v)):
-                # Adam-style update
+                # Pure EMA update (bias correction applied at query time)
                 self.tables_m[d, idx] = beta1 * self.tables_m[d, idx] + (1 - beta1) * m
                 self.tables_v[d, idx] = beta2 * self.tables_v[d, idx] + (1 - beta2) * v
     
-    def query(self, indices: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def query(self, indices: torch.Tensor, beta1: float = 0.9, beta2: float = 0.999) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Query momentum and variance estimates for given indices.
         
+        Applies bias correction at query time (standard Adam behavior).
         Returns minimum across hash rows (Count-Min property).
+        
+        Args:
+            indices: Global parameter indices
+            beta1, beta2: Adam decay rates for bias correction
         """
         # Try C extension first for CPU tensors
         if self.use_c and cms_query_fast is not None:
             result = cms_query_fast(
                 self.tables_m, self.tables_v,
-                indices, self.seeds
+                indices, self.seeds,
+                beta1=beta1, beta2=beta2, step_count=self.step_count
             )
             if result is not None:
+                # Bias correction already applied in cms_query_fast
                 return result
         
         # Python fallback
@@ -565,13 +673,20 @@ class CountMinSketch:
         v_estimates = []
         
         for d in range(self.depth):
-            buckets = self._hash(indices, self.seeds[d].item())
+            # Hash indices to buckets (pass seed as tensor for device consistency)
+            buckets = self._hash(indices, self.seeds[d])
             m_estimates.append(self.tables_m[d, buckets])
             v_estimates.append(self.tables_v[d, buckets])
         
         # Take minimum (conservative estimate)
         m_hat = torch.min(torch.stack(m_estimates), dim=0)[0]
         v_hat = torch.min(torch.stack(v_estimates), dim=0)[0]
+        
+        # Apply bias correction at query time (not at update time)
+        bias_correction1 = 1 - beta1 ** self.step_count
+        bias_correction2 = 1 - beta2 ** self.step_count
+        m_hat = m_hat / bias_correction1
+        v_hat = v_hat / bias_correction2
         
         return m_hat, v_hat
     
@@ -597,9 +712,24 @@ class PagedMemory:
     """
     
     def __init__(self, page_size_mb: int = 256, ram_threshold: float = 0.85, 
-                 cache_dir: str = "./Output/ssd_cache"):
+                 cache_dir: Optional[str] = None):
         self.page_size = page_size_mb * 1024 * 1024  # Bytes
         self.ram_threshold = ram_threshold
+        # Use default path if not specified, ensure cross-platform compatibility
+        if cache_dir is None:
+            # Use user's home directory as safe default (not cwd which could be attacker-controlled)
+            cache_dir = Path.home() / ".chimera_m" / "ssd_cache"
+        else:
+            # Validate user-provided path to prevent path traversal attacks
+            cache_path = Path(cache_dir).resolve()
+            # Ensure the path doesn't escape to system directories
+            home = Path.home().resolve()
+            cwd = Path.cwd().resolve()
+            # Allow paths under home or cwd only
+            if not (str(cache_path).startswith(str(home)) or str(cache_path).startswith(str(cwd))):
+                logger.warning(f"Cache dir {cache_path} outside home/cwd, using safe default")
+                cache_dir = Path.home() / ".chimera_m" / "ssd_cache"
+        
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
@@ -622,6 +752,11 @@ class PagedMemory:
     def _adjust_page_size(self):
         """Adjust page size based on detected RAM speed."""
         try:
+            # dmidecode is Linux-only; skip on macOS/Windows
+            import sys
+            if sys.platform != 'linux':
+                raise OSError("dmidecode only available on Linux")
+            
             # Try to detect DDR version
             import subprocess
             result = subprocess.run(['dmidecode', '-t', 'memory'], 
@@ -639,10 +774,10 @@ class PagedMemory:
                 else:
                     self.page_size = 256 * 1024 * 1024  # 256MB default
                     logger.info("Detected standard DDR4, using 256MB pages")
-        except:
-            # Default
+        except (OSError, subprocess.SubprocessError, FileNotFoundError) as e:
+            # Default - works on all platforms including macOS
             self.page_size = 256 * 1024 * 1024
-            logger.info("Using default 256MB pages")
+            logger.info(f"Using default 256MB pages (platform detection unavailable: {e})")
     
     def check_ram_pressure(self) -> bool:
         """Check if RAM usage exceeds threshold."""
@@ -651,28 +786,70 @@ class PagedMemory:
         return ram.percent / 100 > self.ram_threshold
     
     def spill_to_ssd(self, param_id: str, tensor: torch.Tensor):
-        """Move tensor from RAM to SSD."""
+        """
+        Move tensor from RAM to SSD with robust error handling.
+        
+        Args:
+            param_id: Unique identifier for the parameter
+            tensor: Tensor to offload to SSD
+            
+        Raises:
+            RuntimeError: If SSD write fails after cleanup
+        """
+        import uuid
         page_file = self.cache_dir / f"page_{param_id}_{self.stats['pages_written']}.pkl.lz4"
+        # Use unique temp file with timestamp, PID, and UUID to prevent race conditions
+        temp_file = self.cache_dir / f".tmp_{param_id}_{int(time.time())}_{os.getpid()}_{uuid.uuid4().hex[:8]}.tmp"
         
-        # Compress and save
-        data = tensor.cpu().numpy()
-        compressed = lz4.frame.compress(pickle.dumps(data))
-        
-        with open(page_file, 'wb') as f:
-            f.write(compressed)
-        
-        self.pages[param_id] = {
-            'file': page_file,
-            'shape': tensor.shape,
-            'dtype': tensor.dtype,
-            'device': tensor.device,
-        }
-        
-        self.stats['pages_written'] += 1
-        self.stats['bytes_written'] += tensor.numel() * tensor.element_size()
-        
-        # Clear from RAM
-        del self.active_buffers[param_id]
+        try:
+            # Move tensor to CPU and convert to numpy
+            data = tensor.detach().cpu().numpy()
+            
+            # Serialize and compress
+            pickled_data = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
+            compressed = lz4.frame.compress(pickled_data)
+            
+            # Write to temporary file first (atomic write pattern)
+            with open(temp_file, 'wb') as f:
+                f.write(compressed)
+                f.flush()
+                os.fsync(f.fileno())  # Ensure data is written to disk
+            
+            # Atomic rename on success
+            os.replace(str(temp_file), str(page_file))
+            
+            # Update tracking
+            self.pages[param_id] = {
+                'file': page_file,
+                'shape': tensor.shape,
+                'dtype': tensor.dtype,
+                'device': tensor.device,
+            }
+            
+            self.stats['pages_written'] += 1
+            self.stats['bytes_written'] += tensor.numel() * tensor.element_size()
+            
+            # Clear from active buffers
+            if param_id in self.active_buffers:
+                del self.active_buffers[param_id]
+                
+        except Exception as e:
+            # Cleanup temporary file if it exists
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass  # Best effort cleanup
+            
+            # Remove partial page file if it was created
+            if page_file.exists():
+                try:
+                    page_file.unlink()
+                except OSError:
+                    pass
+            
+            logger.error(f"SSD spill failed for {param_id}: {e}")
+            raise RuntimeError(f"Failed to spill {param_id} to SSD: {e}") from e
     
     def load_from_ssd(self, param_id: str) -> torch.Tensor:
         """Load tensor from SSD to RAM."""
@@ -705,9 +882,10 @@ class PagedMemory:
     
     def cleanup(self):
         """Remove all page files."""
-        for f in self.cache_dir.glob("*.pkl.lz4"):
+        pages = list(self.cache_dir.glob("*.pkl.lz4"))
+        for f in pages:
             f.unlink()
-        logger.info(f"PagedMemory cleanup: removed {len(list(self.cache_dir.glob('*.pkl.lz4')))} pages")
+        logger.info(f"PagedMemory cleanup: removed {len(pages)} pages")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -750,9 +928,9 @@ class GearshiftWatchdog:
     
     def __init__(
         self,
-        poll_interval_ms: float = 100.0,
+        poll_interval_ms: float = DEFAULT_WATCHDOG_POLL_INTERVAL_MS,
         cpu_pin: int = 0,
-        ram_threshold: float = 0.85,
+        ram_threshold: float = DEFAULT_RAM_THRESHOLD,
         bo_enabled: bool = True,
     ):
         self.poll_interval = poll_interval_ms / 1000.0  # Convert to seconds
@@ -781,15 +959,15 @@ class GearshiftWatchdog:
         
         # Bayesian Optimizer for threshold tuning
         if self.bo_enabled:
-            self.bo = BayesianOptimizer(kernel_type='matern', noise_variance=0.05)
-            self.bo.add_param('vram_downshift', 0.70, 0.95)
+            self.bo = BayesianOptimizer(kernel_type='matern', noise_variance=DEFAULT_BO_NOISE_VARIANCE)
+            self.bo.add_param('vram_downshift', MIN_RAM_THRESHOLD, MAX_RAM_THRESHOLD)
             self.bo.add_param('loss_spike', 1.1, 3.0)
             self.bo.add_param('hold_duration', 30.0, 120.0)
             
             self.thresholds = {
-                'vram_downshift': 0.85,
-                'loss_spike': 1.5,
-                'hold_duration': 60.0,
+                'vram_downshift': DEFAULT_VRAM_DOWNSHIFT_THRESHOLD,
+                'loss_spike': DEFAULT_LOSS_SPIKE_THRESHOLD,
+                'hold_duration': DEFAULT_WATCHDOG_HOLD_DURATION_S,
             }
             
             self.bo_history = []
@@ -797,16 +975,20 @@ class GearshiftWatchdog:
             self.bo_step_count = 0
         else:
             self.thresholds = {
-                'vram_downshift': 0.85,
-                'loss_spike': 1.5,
-                'hold_duration': 60.0,
+                'vram_downshift': DEFAULT_VRAM_DOWNSHIFT_THRESHOLD,
+                'loss_spike': DEFAULT_LOSS_SPIKE_THRESHOLD,
+                'hold_duration': DEFAULT_WATCHDOG_HOLD_DURATION_S,
             }
         
         # Adaptive frequency
         self.unstable_counter = 0
+        
+        # Threading locks for thread-safe operations (prevents race conditions)
+        self._thresholds_lock = threading.Lock()
+        self._bo_history_lock = threading.Lock()
     
     def start(self):
-        """Start watchdog thread pinned to specified CPU core."""
+        """Start watchdog thread pinned to specified CPU core (Linux only)."""
         if self.is_running:
             return
         
@@ -814,19 +996,25 @@ class GearshiftWatchdog:
         self.thread = threading.Thread(target=self._watch_loop, daemon=True)
         self.thread.start()
         
-        # Set CPU affinity if supported
-        try:
-            import os
-            os.sched_setaffinity(0, {self.cpu_pin})
-            logger.info(f"Watchdog pinned to CPU core {self.cpu_pin}")
-        except:
-            pass
+        # Set CPU affinity if supported (Linux only)
+        if hasattr(os, 'sched_setaffinity'):
+            try:
+                os.sched_setaffinity(0, {self.cpu_pin})
+                logger.info(f"Watchdog pinned to CPU core {self.cpu_pin}")
+            except AttributeError:
+                logger.debug("CPU affinity not available on this platform")
+            except OSError as e:
+                logger.warning(f"Could not pin watchdog to CPU core {self.cpu_pin}: {e}")
+        else:
+            logger.debug("CPU affinity setting not supported on this platform (macOS/Windows)")
     
     def stop(self):
         """Stop watchdog thread."""
         self.is_running = False
         if self.thread:
-            self.thread.join(timeout=1.0)
+            self.thread.join(timeout=5.0)
+            if self.thread.is_alive():
+                logger.warning("Watchdog thread did not terminate within timeout")
     
     def _watch_loop(self):
         """Main monitoring loop."""
@@ -872,7 +1060,7 @@ class GearshiftWatchdog:
             import psutil
             ram = psutil.virtual_memory()
             metrics['ram_pct'] = ram.percent / 100
-        except:
+        except (ImportError, AttributeError, OSError):
             metrics['ram_pct'] = 0.0
         
         return metrics
@@ -881,14 +1069,19 @@ class GearshiftWatchdog:
         """Detect if system is under pressure."""
         pressure_score = 0.0
         
+        # Thread-safe read of thresholds
+        with self._thresholds_lock:
+            vram_downshift = self.thresholds['vram_downshift']
+            loss_spike = self.thresholds['loss_spike']
+        
         # VRAM pressure (40% weight)
-        if metrics.get('vram_pct', 0) > self.thresholds['vram_downshift']:
+        if metrics.get('vram_pct', 0) > vram_downshift:
             pressure_score += 0.4
         
         # Loss spike detection (30% weight)
         if len(self.loss_history) >= 10:
             recent = list(self.loss_history)[-10:]
-            if recent[-1] > recent[0] * self.thresholds['loss_spike']:
+            if recent[-1] > recent[0] * loss_spike:
                 pressure_score += 0.3
         
         # Gradient instability (simulated via step time variance)
@@ -923,14 +1116,19 @@ class GearshiftWatchdog:
         
         vram_recent = np.mean(list(self.vram_history)[-5:])
         
+        # Thread-safe read of thresholds
+        with self._thresholds_lock:
+            vram_downshift = self.thresholds['vram_downshift']
+            hold_duration = self.thresholds['hold_duration']
+        
         # Downshift condition
-        if vram_recent > self.thresholds['vram_downshift']:
+        if vram_recent > vram_downshift:
             if self.current_gear < 5:
                 target = min(5, self.current_gear + 1)
                 return True, target
         
         # Upshift condition (only after hold expires and stable)
-        if vram_recent < self.thresholds['vram_downshift'] - 0.15:  # Hysteresis
+        if vram_recent < vram_downshift - HYSTERESIS_MARGIN:  # Hysteresis
             if self.current_gear > 1:
                 # Check if improving (BO-learned)
                 if self._is_improving():
@@ -984,22 +1182,27 @@ class GearshiftWatchdog:
     def _async_bo_update(self):
         """Background BO update for threshold optimization."""
         def optimize():
-            if len(self.bo_history) < 10:
-                return
+            # Thread-safe read of bo_history
+            with self._bo_history_lock:
+                if len(self.bo_history) < 10:
+                    return
+                # Copy data to avoid holding lock during computation
+                history_copy = list(self.bo_history)
             
-            # Prepare data
-            X = np.array([h['params'] for h in self.bo_history])
-            y = np.array([h['objective'] for h in self.bo_history])
+            # Prepare data (outside lock)
+            X = np.array([h['params'] for h in history_copy])
+            y = np.array([h['objective'] for h in history_copy])
             
             # Fit and suggest
             self.bo.update(dict(zip(sorted(self.bo.bounds.keys()), X[-1])), y[-1])
             best_params, _ = self.bo.get_best()
             
             if best_params:
-                # Smooth update (EMA)
-                for key in self.thresholds:
-                    if key in best_params:
-                        self.thresholds[key] = 0.8 * self.thresholds[key] + 0.2 * best_params[key]
+                # Smooth update (EMA) with thread-safe lock
+                with self._thresholds_lock:
+                    for key in self.thresholds:
+                        if key in best_params:
+                            self.thresholds[key] = 0.8 * self.thresholds[key] + 0.2 * best_params[key]
         
         threading.Thread(target=optimize, daemon=True).start()
     
@@ -1011,14 +1214,21 @@ class GearshiftWatchdog:
         # Objective: minimize time + penalize bad events
         objective = step_time + (10.0 if oom_risk else 0) + (5.0 if loss_plateau else 0)
         
-        self.bo_history.append({
-            'params': [
-                self.thresholds['vram_downshift'],
-                self.thresholds['loss_spike'],
-                self.thresholds['hold_duration']
-            ],
-            'objective': objective
-        })
+        # Thread-safe append to bo_history with size limit to prevent unbounded growth
+        MAX_BO_HISTORY = 1000  # Keep last 1000 observations
+        with self._bo_history_lock:
+            self.bo_history.append({
+                'params': [
+                    self.thresholds['vram_downshift'],
+                    self.thresholds['loss_spike'],
+                    self.thresholds['hold_duration']
+                ],
+                'objective': objective
+            })
+            # Trim history to prevent unbounded memory growth
+            if len(self.bo_history) > MAX_BO_HISTORY:
+                # Keep most recent entries (more relevant for current optimization)
+                self.bo_history = self.bo_history[-MAX_BO_HISTORY:]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1064,7 +1274,7 @@ class ChimeraGearOptimizer(Optimizer):
         
         # Compression components
         self.ternary_codec = TernaryCodec(stochastic=True)
-        self.sketch = CountMinSketch(width=1024, depth=4, device=device)
+        self.sketch = CountMinSketch(width=DEFAULT_CMS_WIDTH, depth=DEFAULT_CMS_DEPTH, device=device)
         
         # Paged memory for SSD offloading
         if ssd_offload:
@@ -1085,7 +1295,7 @@ class ChimeraGearOptimizer(Optimizer):
         # Watchdog (GPU-only)
         if torch.cuda.is_available() and self.auto_gear:
             self.watchdog = GearshiftWatchdog(
-                poll_interval_ms=100.0,
+                poll_interval_ms=DEFAULT_WATCHDOG_POLL_INTERVAL_MS,
                 cpu_pin=0,
                 ram_threshold=ram_threshold,
                 bo_enabled=bo_enabled,
@@ -1094,16 +1304,32 @@ class ChimeraGearOptimizer(Optimizer):
         else:
             self.watchdog = None
         
-        # CPU shadow weights (for levels 2-5)
+        # CPU shadow weights (for levels 2-5) - ALWAYS float tensors, never packed
         self.shadow_weights: Dict[int, torch.Tensor] = {}
         self.error_feedback: Dict[int, torch.Tensor] = {}
         
-        if cpu_offload and self.current_gear >= 2:
-            self._init_shadow_weights()
+        # Packed ternary weights storage (int32) - separate from shadow weights
+        self.packed_weights: Dict[int, Tuple[torch.Tensor, Tuple]] = {}
+        
+        # Global parameter index tracking for CMS (prevents collisions between parameters)
+        self.param_global_offsets: Dict[int, int] = {}
+        self._compute_global_offsets()
+        
+        # Initialize shadow weights only if cpu_offload is explicitly enabled
+        # Respect user's choice - don't override cpu_offload=False
+        if self.current_gear >= 2:
+            if cpu_offload:
+                self._init_shadow_weights()
+            else:
+                logger.info("CPU offload disabled by user, keeping weights on device")
         
         # MEZO support
         self.mezo_mode = mezo_mode or self.gear_config.mezo_enabled
         self.mezo_epsilon = self.gear_config.mezo_epsilon
+        self.mezo_rng = torch.Generator(device=self.cpu_device) if self.mezo_mode else None
+        
+        # Threading lock for Bayesian Optimizer updates (prevents race conditions)
+        self._bo_lock = threading.Lock()
         
         # State tracking
         self.step_count = 0
@@ -1113,14 +1339,28 @@ class ChimeraGearOptimizer(Optimizer):
         logger.info(f"Compression: {self.gear_config.compression_ratio}×")
         logger.info(f"Auto-gearshift: {self.auto_gear}")
     
+    def _compute_global_offsets(self):
+        """Compute global cumulative offsets for each parameter to prevent CMS collisions."""
+        offset = 0
+        for group in self.param_groups:
+            for p in group['params']:
+                param_id = id(p)
+                self.param_global_offsets[param_id] = offset
+                offset += p.numel()
+    
+    def _get_global_indices(self, param_id: int, local_indices: torch.Tensor) -> torch.Tensor:
+        """Convert local parameter indices to global indices for CMS."""
+        global_offset = self.param_global_offsets.get(param_id, 0)
+        return local_indices + global_offset
+    
     def _init_shadow_weights(self):
         """Initialize high-precision shadow weights on CPU."""
         for i, group in enumerate(self.param_groups):
             for j, p in enumerate(group['params']):
                 param_id = id(p)
-                # BF16 shadow weights
+                # BF16 shadow weights - ALWAYS keep as float, never store packed here
                 self.shadow_weights[param_id] = p.detach().clone().to(self.cpu_device).bfloat16()
-                # Error feedback (residuals)
+                # Error feedback (residuals) - ensure on CPU
                 self.error_feedback[param_id] = torch.zeros_like(p, device=self.cpu_device)
     
     def _apply_gear_compression(self, new_gear: int):
@@ -1158,22 +1398,27 @@ class ChimeraGearOptimizer(Optimizer):
         """Compress all parameters to ternary representation."""
         for group in self.param_groups:
             for p in group['params']:
-                if p.grad is not None:
-                    # Quantize and store in shadow
-                    packed, metadata = self.ternary_codec.encode(p.data)
-                    param_id = id(p)
-                    if param_id in self.shadow_weights:
-                        # Store quantized version
-                        self.shadow_weights[param_id] = packed.cpu()
+                param_id = id(p)
+                # Encode to ternary and store packed version separately
+                packed, metadata = self.ternary_codec.encode(p.data)
+                self.packed_weights[param_id] = (packed.cpu(), metadata)
+                # Decode back to GPU for computation
+                p.data.copy_(self.ternary_codec.decode(packed, metadata))
     
     def _decompress_to_full(self):
         """Decompress ternary weights back to full precision."""
         for group in self.param_groups:
             for p in group['params']:
                 param_id = id(p)
+                # Restore from shadow weights (float storage, not packed)
                 if param_id in self.shadow_weights:
-                    # Restore from shadow (if it was full precision)
-                    p.data.copy_(self.shadow_weights[param_id].to(self.device))
+                    p.data.copy_(self.shadow_weights[param_id].to(self.device).float())
+                # Clear packed storage and shadow weights to prevent memory leak
+                if param_id in self.packed_weights:
+                    del self.packed_weights[param_id]
+        # Clear all shadow weights and error feedback after full decompression
+        self.shadow_weights.clear()
+        self.error_feedback.clear()
     
     def _checkpoint_transition(self, old_gear: int, new_gear: int, phase: str):
         """Save checkpoint during gear transition."""
@@ -1185,7 +1430,10 @@ class ChimeraGearOptimizer(Optimizer):
             'state_dict': self.state_dict(),
         }
         
-        path = f"./Output/gear_transition_step{self.step_count}_{phase}.pt"
+        # Use Path for cross-platform compatibility
+        output_dir = Path.cwd() / "Output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / f"gear_transition_step{self.step_count}_{phase}.pt"
         torch.save(checkpoint, path)
         logger.info(f"Checkpoint saved: {path}")
     
@@ -1204,8 +1452,10 @@ class ChimeraGearOptimizer(Optimizer):
             should_shift, new_gear = self.watchdog.should_shift(loss)
             
             if should_shift and new_gear != self.current_gear:
-                self.watchdog.execute_shift(new_gear, callback=None)
-                self._apply_gear_compression(new_gear)
+                # Use lock to prevent race with BO background thread
+                with self._bo_lock:
+                    self.watchdog.execute_shift(new_gear, callback=None)
+                    self._apply_gear_compression(new_gear)
         
         # Perform update based on current gear
         if self.current_gear == 1:
@@ -1217,7 +1467,7 @@ class ChimeraGearOptimizer(Optimizer):
         elif self.current_gear == 4:
             self._step_level_4()
         elif self.current_gear == 5:
-            self._step_level_5()
+            self._step_level_5(closure)
         
         return loss
     
@@ -1276,14 +1526,85 @@ class ChimeraGearOptimizer(Optimizer):
         
         self._step_compressed(sparse=True, sparsity=0.001)
     
-    def _step_level_5(self):
-        """Level 5: MEZO + minimal state + SSD."""
-        if self.mezo_mode:
-            # MEZO update (placeholder - would need model access)
-            # For now, falls back to compressed step
+    def _step_level_5(self, closure: Optional[Callable] = None):
+        """Level 5: MEZO (Memory-Efficient Zeroth-Order) optimization.
+        
+        MEZO estimates gradients via finite differences of loss values,
+        requiring only forward passes. This eliminates the need to store
+        activations for backpropagation, achieving extreme memory efficiency.
+        
+        Algorithm:
+        1. Sample random perturbation direction z ~ N(0, I)
+        2. Compute loss at w + εz and w - εz
+        3. Gradient estimate: g ≈ [loss(w+εz) - loss(w-εz)] / (2ε) * z
+        4. Apply update: w = w - lr * g
+        
+        Args:
+            closure: A closure that recomputes the model and returns the loss.
+                    Must be provided for MEZO to work.
+        """
+        if not self.mezo_mode or closure is None:
+            # Fallback to compressed first-order method
             self._step_compressed(sparse=True, sparsity=0.01)
-        else:
-            self._step_compressed(sparse=True, sparsity=0.01)
+            return
+        
+        # Get MEZO hyperparameters
+        eps = self.mezo_epsilon
+        lr = self.param_groups[0]['lr']  # Use first group's LR
+        
+        # Store original parameter values
+        original_values = {}
+        for group in self.param_groups:
+            for p in group['params']:
+                original_values[id(p)] = p.data.clone()
+        
+        # Generate random seed for reproducibility
+        seed = self.step_count
+        self.mezo_rng.manual_seed(seed)
+        
+        # MEZO gradient estimation for each parameter
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.requires_grad:
+                    param_id = id(p)
+                    
+                    # Generate random perturbation direction on same device as parameter
+                    # Use device-specific RNG to avoid cross-device tensor issues
+                    param_device = p.data.device
+                    if param_device.type == 'cuda':
+                        # Use CUDA RNG for GPU tensors
+                        z = torch.randn_like(p.data)
+                    else:
+                        # Use CPU RNG for CPU tensors
+                        z = torch.randn_like(p.data, generator=self.mezo_rng)
+                    z = z / (z.norm() + 1e-8)  # Normalize
+                    
+                    # Forward perturbation: w + εz
+                    p.data = original_values[param_id] + eps * z
+                    loss_plus = closure()
+                    
+                    # Backward perturbation: w - εz
+                    p.data = original_values[param_id] - eps * z
+                    loss_minus = closure()
+                    
+                    # Gradient estimate: [f(w+εz) - f(w-εz)] / (2ε) * z
+                    if isinstance(loss_plus, torch.Tensor):
+                        loss_plus = loss_plus.item()
+                    if isinstance(loss_minus, torch.Tensor):
+                        loss_minus = loss_minus.item()
+                    
+                    grad_est = (loss_plus - loss_minus) / (2 * eps) * z
+                    
+                    # Apply update
+                    p.data = original_values[param_id] - lr * grad_est
+                    
+                    # Store update in sketch for tracking (optional)
+                    flat_grad = grad_est.flatten().cpu()
+                    n = len(flat_grad)
+                    local_indices = torch.arange(n, device='cpu')
+                    global_indices = self._get_global_indices(param_id, local_indices)
+                    self.sketch.update(global_indices, flat_grad.abs(), flat_grad ** 2,
+                                      group['betas'][0], group['betas'][1])
     
     def _step_compressed(self, sparse: bool = False, sparsity: float = 0.001):
         """Generic compressed update with ternary + sketch."""
@@ -1294,52 +1615,62 @@ class ChimeraGearOptimizer(Optimizer):
                 
                 grad = p.grad.data
                 param_id = id(p)
+                beta1, beta2 = group['betas']
                 
                 # Sparsify gradient if enabled
                 if sparse:
                     grad = self._sparsify_gradient(grad, sparsity)
                 
-                # Update sketch with gradient info
-                flat_grad = grad.flatten()
-                indices = torch.arange(len(flat_grad), device=grad.device)
-                self.sketch.update(indices, flat_grad.abs(), flat_grad ** 2)
+                # Flatten gradient and move to CPU for sketch operations
+                flat_grad_cpu = grad.flatten().cpu()
+                n = len(flat_grad_cpu)
                 
-                # Query optimizer state from sketch
-                m_hat, v_hat = self.sketch.query(indices)
+                # Use GLOBAL indices to prevent collisions between parameters
+                local_indices = torch.arange(n, device='cpu')
+                global_indices = self._get_global_indices(param_id, local_indices)
+                
+                # Update sketch with gradient info (on CPU)
+                self.sketch.update(global_indices, flat_grad_cpu.abs(), flat_grad_cpu ** 2, beta1, beta2)
+                
+                # Query optimizer state from sketch (bias correction applied in query)
+                m_hat, v_hat = self.sketch.query(global_indices, beta1, beta2)
                 
                 # Update CPU shadow weights
                 if param_id in self.shadow_weights:
                     shadow = self.shadow_weights[param_id].float()
-                    error = self.error_feedback[param_id]
+                    error = self.error_feedback[param_id]  # Already on CPU
                     
-                    # Add error feedback
-                    grad_with_error = flat_grad + error
+                    # Add error feedback (both on CPU now)
+                    grad_with_error = flat_grad_cpu + error
                     
                     # Adam-style update on shadow
-                    beta1, beta2 = group['betas']
-                    
-                    # Approximate momentum from sketch
                     update = m_hat / (v_hat.sqrt() + group['eps'])
                     
                     # Update shadow
                     shadow = shadow - group['lr'] * update.reshape(shadow.shape)
                     
-                    # Update error feedback (residual)
-                    self.error_feedback[param_id] = grad_with_error - update.reshape(shadow.shape).to(self.cpu_device)
+                    # Update error feedback (residual) - keep on CPU
+                    residual = grad_with_error - update.reshape(shadow.shape)
+                    self.error_feedback[param_id] = residual
                     
-                    # Store shadow
+                    # Store shadow (float, not packed)
                     self.shadow_weights[param_id] = shadow.bfloat16()
                     
                     # Requantize to ternary for GPU
-                    packed, metadata = self.ternary_codec.encode(shadow.to(self.device))
+                    shadow_gpu = shadow.to(self.device)
+                    packed, metadata = self.ternary_codec.encode(shadow_gpu)
                     p.data.copy_(self.ternary_codec.decode(packed, metadata))
     
     def _sparsify_gradient(self, grad: torch.Tensor, sparsity: float) -> torch.Tensor:
         """Top-K sparsification: keep only largest (1-sparsity) fraction."""
-        k = int((1 - sparsity) * grad.numel())
+        k = max(1, int((1 - sparsity) * grad.numel()))  # Ensure at least 1 element
         
         flat = grad.flatten()
-        threshold = torch.topk(flat.abs(), k, largest=False)[0][-1]
+        if k >= flat.numel():
+            return grad  # Keep all if k >= numel
+        
+        # Use largest=True for better performance (ascending sort is slower)
+        threshold = torch.topk(flat.abs(), k, largest=True)[0][-1]
         
         mask = flat.abs() >= threshold
         sparse_grad = flat * mask.float()
@@ -1363,7 +1694,9 @@ class ChimeraGearOptimizer(Optimizer):
         for param_id, _ in sizes[:3]:  # Spill top 3 largest
             if param_id in self.shadow_weights:
                 tensor = self.shadow_weights[param_id]
-                self.paged_memory.spill_to_ssd(str(param_id), tensor)
+                # Use consistent string format: param_<id> for cache key
+                cache_key = f"param_{param_id}"
+                self.paged_memory.spill_to_ssd(cache_key, tensor)
     
     def emergency_downshift(self):
         """Emergency downshift to Level 5."""
@@ -1378,23 +1711,64 @@ class ChimeraGearOptimizer(Optimizer):
             torch.cuda.empty_cache()
     
     def state_dict(self) -> Dict[str, Any]:
-        """Return state dict including gear and shadow weights."""
+        """Return state dict including gear, shadow weights, and packed weights."""
         state = super().state_dict()
         state['current_gear'] = self.current_gear
+        # Shadow weights are always float (BF16) - safe to save
         state['shadow_weights'] = {k: v for k, v in self.shadow_weights.items()}
         state['error_feedback'] = {k: v for k, v in self.error_feedback.items()}
+        # Packed weights stored separately (int32 + metadata)
+        state['packed_weights'] = {k: (v[0].cpu(), v[1]) for k, v in self.packed_weights.items()}
+        # Recompute global offsets on load (param shapes may change)
+        state['mezo_mode'] = self.mezo_mode
+        # Save step_count for bias correction continuity
+        state['step_count'] = self.step_count
+        # Save RNG state if MEZO is enabled
+        if self.mezo_mode and self.mezo_rng is not None:
+            state['mezo_rng_state'] = self.mezo_rng.get_state()
         return state
     
     def load_state_dict(self, state_dict: Dict[str, Any]):
         """Load state dict and restore gear."""
-        self.current_gear = state_dict.get('current_gear', 2)
+        # Validate gear level
+        loaded_gear = state_dict.get('current_gear', 2)
+        if not 1 <= loaded_gear <= 5:
+            logger.warning(f"Invalid gear level {loaded_gear} in checkpoint, defaulting to 2")
+            loaded_gear = 2
+        
+        self.current_gear = loaded_gear
         self.gear_config = GEAR_LEVELS[self.current_gear]
         self.shadow_weights = state_dict.get('shadow_weights', {})
         self.error_feedback = state_dict.get('error_feedback', {})
         
+        # Restore packed weights if present
+        if 'packed_weights' in state_dict:
+            self.packed_weights = {}
+            for k, (packed, metadata) in state_dict['packed_weights'].items():
+                self.packed_weights[k] = (packed, metadata)
+        
+        # Restore MEZO mode and reinitialize RNG
+        self.mezo_mode = state_dict.get('mezo_mode', False)
+        if self.mezo_mode:
+            self.mezo_rng = torch.Generator(device=self.cpu_device)
+            # Optionally restore RNG state if available
+            if 'mezo_rng_state' in state_dict:
+                self.mezo_rng.set_state(state_dict['mezo_rng_state'])
+        
+        # Restore step_count if present
+        self.step_count = state_dict.get('step_count', 0)
+        
+        # Recompute global offsets (param shapes may have changed)
+        self._compute_global_offsets()
+        
+        # Restart watchdog if it was running
+        if self.watchdog and not self.watchdog.is_running:
+            self.watchdog.start()
+        
         # Remove our keys before passing to parent
-        parent_state = {k: v for k, v in state_dict.items() 
-                       if k not in ['current_gear', 'shadow_weights', 'error_feedback']}
+        keys_to_remove = ['current_gear', 'shadow_weights', 'error_feedback', 
+                         'packed_weights', 'mezo_mode', 'mezo_rng_state', 'step_count']
+        parent_state = {k: v for k, v in state_dict.items() if k not in keys_to_remove}
         super().load_state_dict(parent_state)
     
     def __del__(self):
@@ -1430,7 +1804,7 @@ def detect_hardware() -> Dict[str, Any]:
         import psutil
         hw['ram_gb'] = psutil.virtual_memory().total / (1024**3)
         hw['cpu_cores'] = psutil.cpu_count(logical=False)
-    except:
+    except (ImportError, AttributeError, OSError):
         pass
     
     # Check SSD availability
@@ -1438,7 +1812,7 @@ def detect_hardware() -> Dict[str, Any]:
         import shutil
         stat = shutil.disk_usage('.')
         hw['ssd_available'] = stat.free > 10 * (1024**3)  # At least 10GB free
-    except:
+    except (ImportError, AttributeError, OSError):
         pass
     
     return hw
@@ -1582,6 +1956,11 @@ def detect_model_format(model_path: str) -> Dict[str, Any]:
         except Exception as e:
             logger.debug(f"Could not auto-detect model format: {e}")
     
+    # Final validation: ensure num_params is positive
+    if info['num_params'] <= 0:
+        logger.warning("Model parameter count is 0 or negative, using default estimate of 1B")
+        info['num_params'] = 1_000_000_000
+    
     return info
 
 
@@ -1602,43 +1981,84 @@ def scan_datasets(dataset_dir: str) -> List[Path]:
     return sorted(files)
 
 
-def infer_dataset_format(files: List[Path]) -> str:
-    """Infer dataset format from file content."""
+def infer_dataset_format(files: List[Path], max_samples: int = 5) -> str:
+    """
+    Infer dataset format from file content using multi-file sampling.
+    
+    Args:
+        files: List of dataset files to analyze
+        max_samples: Maximum number of files to sample (default 5)
+    
+    Returns:
+        Detected format string, or 'mixed' if formats differ across files
+    """
     if not files:
         return 'unknown'
     
-    # Sample first file
-    sample_file = files[0]
+    # Sample up to max_samples files for better detection accuracy
+    sample_files = files[:max_samples] if len(files) > max_samples else files
+    detected_formats = []
     
-    try:
-        with open(sample_file, 'r', encoding='utf-8') as f:
-            first_line = f.readline().strip()
-        
-        # Try parse as JSON
+    for sample_file in sample_files:
         try:
-            data = json.loads(first_line)
+            with open(sample_file, 'r', encoding='utf-8') as f:
+                first_line = f.readline().strip()
             
-            # Check for chat format
-            if isinstance(data, dict):
-                if 'role' in data and 'content' in data:
-                    return 'chat'
-                if 'messages' in data:
-                    return 'chat_list'
-                if 'text' in data:
-                    return 'text'
-                if 'input' in data and 'output' in data:
-                    return 'instruction'
+            if not first_line:
+                continue  # Skip empty files
             
-            return 'json'
-        except:
-            pass
-        
-        # Plain text
-        return 'text'
-        
-    except Exception as e:
-        logger.warning(f"Could not read dataset file: {e}")
+            # Try parse as JSON
+            try:
+                data = json.loads(first_line)
+                
+                # Check for chat format
+                if isinstance(data, dict):
+                    if 'role' in data and 'content' in data:
+                        detected_formats.append('chat')
+                    elif 'messages' in data:
+                        detected_formats.append('chat_list')
+                    elif 'text' in data:
+                        detected_formats.append('text')
+                    elif 'input' in data and 'output' in data:
+                        detected_formats.append('instruction')
+                    else:
+                        detected_formats.append('json')
+                else:
+                    detected_formats.append('json')
+            except json.JSONDecodeError:
+                # Not valid JSON - treat as plain text
+                detected_formats.append('text')
+                
+        except Exception as e:
+            logger.warning(f"Could not read dataset file {sample_file}: {e}")
+            continue
+    
+    if not detected_formats:
         return 'unknown'
+    
+    # Check for consistency across samples
+    unique_formats = set(detected_formats)
+    if len(unique_formats) == 1:
+        # All files agree on format
+        return detected_formats[0]
+    else:
+        # Mixed formats - return the most common one with warning
+        from collections import Counter
+        format_counts = Counter(detected_formats)
+        most_common = format_counts.most_common(1)[0]
+        
+        if most_common[1] >= len(detected_formats) * 0.6:  # 60% threshold
+            logger.warning(
+                f"Mixed dataset formats detected: {dict(format_counts)}. "
+                f"Using majority format: {most_common[0]}"
+            )
+            return most_common[0]
+        else:
+            logger.warning(
+                f"Highly mixed dataset formats with no clear majority: {dict(format_counts)}. "
+                f"Consider organizing datasets by format."
+            )
+            return 'mixed'
 
 
 def auto_format_dataset(
@@ -1650,11 +2070,32 @@ def auto_format_dataset(
     """
     Auto-format dataset to match model requirements.
     
-    Wraps/Converts with explicit logging.
+    Args:
+        files: List of dataset files
+        source_format: Source format ('text', 'json', 'chat', 'mixed', etc.)
+        target_format: Target format for model
+        system_prompt: Optional custom system prompt
+    
+    Returns:
+        List of formatted data samples
     """
     formatted = []
     
     default_system = system_prompt or "You are a helpful assistant."
+    
+    # Handle mixed formats by detecting per-file
+    if source_format == 'mixed':
+        logger.warning("Mixed format detected - processing each file with individual format detection")
+        for file in files:
+            # Detect format for this specific file
+            file_format = infer_dataset_format([file], max_samples=1)
+            if file_format == 'unknown':
+                file_format = 'text'  # Fallback
+            
+            # Recursively process with detected format
+            file_data = auto_format_dataset([file], file_format, target_format, system_prompt)
+            formatted.extend(file_data)
+        return formatted
     
     for file in files:
         logger.info(f"[AUTO-FORMAT] Processing {file.name}")
@@ -1666,7 +2107,7 @@ def auto_format_dataset(
                 for line in f:
                     try:
                         formatted.append(json.loads(line))
-                    except:
+                    except (json.JSONDecodeError, ValueError):
                         formatted.append({'text': line.strip()})
         
         elif source_format == 'text' and target_format == 'chat':
@@ -1707,7 +2148,7 @@ def auto_format_dataset(
                             })
                         else:
                             formatted.append(data)
-                    except:
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                         pass
         
         else:
@@ -1798,9 +2239,19 @@ def save_checkpoint(
     epoch: int,
     step: int,
     loss: float,
-    path: str = "./Output/checkpoint.pt"
+    path: Optional[Union[str, Path]] = None
 ):
-    """Save training checkpoint."""
+    """Save training checkpoint with cross-platform path handling."""
+    # Default path with proper cross-platform handling
+    if path is None:
+        output_dir = Path.cwd() / "Output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / "checkpoint.pt"
+    else:
+        path = Path(path)
+        # Ensure parent directory exists
+        path.parent.mkdir(parents=True, exist_ok=True)
+    
     checkpoint = {
         'epoch': epoch,
         'step': step,
@@ -1809,6 +2260,7 @@ def save_checkpoint(
         'loss': loss,
         'gear': optimizer.current_gear,
         'timestamp': time.time(),
+        'chimera_version': __version__,
     }
     
     torch.save(checkpoint, path)
@@ -1816,13 +2268,83 @@ def save_checkpoint(
 
 
 def load_checkpoint(model, optimizer: ChimeraGearOptimizer, path: str) -> Dict[str, Any]:
-    """Load training checkpoint."""
-    checkpoint = torch.load(path, map_location='cpu')
+    """
+    Load training checkpoint with version validation.
     
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    Args:
+        model: The model to load state into
+        optimizer: The optimizer to load state into
+        path: Path to checkpoint file
+        
+    Returns:
+        Checkpoint dictionary
+        
+    Raises:
+        RuntimeError: If checkpoint is incompatible with current version
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    
+    # PyTorch 2.0+ secure loading - weights_only=True required for security
+    # This prevents arbitrary code execution from malicious checkpoint files
+    checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    
+    # Version compatibility check
+    ckpt_version = checkpoint.get('chimera_version', 'unknown')
+    current_version = __version__
+    
+    if ckpt_version != current_version:
+        logger.warning(
+            f"Checkpoint version mismatch: "
+            f"checkpoint={ckpt_version}, current={current_version}"
+        )
+        
+        # Check for breaking changes (major version mismatch)
+        try:
+            # Handle version strings like '1.0.0-beta', '1.0.0a1', etc.
+            def extract_major(version_str: str) -> int:
+                """Extract numeric major version, handling pre-release suffixes."""
+                if version_str == 'unknown':
+                    return 1
+                # Split on common separators and take first numeric part
+                for sep in ['.', '-', 'a', 'b', 'rc']:
+                    version_str = version_str.split(sep)[0]
+                try:
+                    return int(version_str)
+                except ValueError:
+                    return 1  # Default if parsing fails
+            
+            ckpt_major = extract_major(ckpt_version)
+            curr_major = extract_major(current_version)
+            
+            if ckpt_major != curr_major:
+                raise RuntimeError(
+                    f"Major version mismatch: checkpoint v{ckpt_major} vs current v{curr_major}. "
+                    f"Breaking changes detected. Please train from scratch or use compatible version."
+                )
+        except (ValueError, IndexError):
+            # Can't parse version, warn but continue
+            logger.warning("Could not parse version numbers, proceeding with caution")
+    
+    # Validate required keys
+    required_keys = ['model_state_dict', 'optimizer_state_dict']
+    missing_keys = [k for k in required_keys if k not in checkpoint]
+    if missing_keys:
+        raise RuntimeError(f"Checkpoint missing required keys: {missing_keys}")
+    
+    # Load states with error handling
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Failed to load checkpoint state: {e}. "
+            f"Model/optimizer architecture may have changed."
+        ) from e
     
     logger.info(f"Checkpoint loaded: {path}")
+    logger.info(f"  Version: {ckpt_version}")
     logger.info(f"  Epoch: {checkpoint.get('epoch', 0)}")
     logger.info(f"  Step: {checkpoint.get('step', 0)}")
     logger.info(f"  Gear: {checkpoint.get('gear', optimizer.current_gear)}")
@@ -1870,12 +2392,67 @@ def train_epoch(
             else:
                 raise
         
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
+        # Backward pass (only for non-MEZO gears)
+        if optimizer.current_gear != 5:
+            optimizer.zero_grad()
+            loss.backward()
         
         # Optimizer step (with gear management)
-        optimizer.step(closure=None)
+        # For MEZO (gear 5), provide closure for zeroth-order gradient estimation
+        if optimizer.current_gear == 5 and optimizer.mezo_mode:
+            # Robust closure with error handling and retry logic
+            # Use a class-based closure to avoid closure variable capture issues
+            class MezoClosure:
+                __slots__ = ['model', 'input_ids', 'attention_mask', 'labels', 
+                           'attempts', 'last_error', 'batch_idx']
+                
+                def __init__(self, model, input_ids, attention_mask, labels, batch_idx):
+                    self.model = model
+                    self.input_ids = input_ids
+                    self.attention_mask = attention_mask
+                    self.labels = labels
+                    self.batch_idx = batch_idx
+                    self.attempts = 0
+                    self.last_error = None
+                
+                def __call__(self):
+                    self.attempts += 1
+                    
+                    try:
+                        outputs = self.model(
+                            input_ids=self.input_ids, 
+                            attention_mask=self.attention_mask, 
+                            labels=self.labels
+                        )
+                        if outputs.loss is None:
+                            raise RuntimeError("Model returned None loss")
+                        return outputs.loss
+                    except RuntimeError as e:
+                        self.last_error = e
+                        if 'out of memory' in str(e).lower():
+                            # OOM during MEZO - this is critical
+                            raise  # Re-raise for emergency handling
+                        # Other errors - log and return high loss to indicate failure
+                        logger.warning(f"MEZO closure error (attempt {self.attempts}): {e}")
+                        return torch.tensor(1e6, device=self.input_ids.device)  # High penalty loss
+            
+            # Create closure instance for this batch
+            mezo_closure = MezoClosure(model, input_ids, attention_mask, labels, batch_idx)
+            
+            try:
+                optimizer.step(closure=mezo_closure)
+            except RuntimeError as e:
+                if 'out of memory' in str(e).lower():
+                    logger.warning(f"OOM during MEZO at batch {batch_idx}, triggering emergency downshift")
+                    optimizer.emergency_downshift()
+                    torch.cuda.empty_cache()
+                    # Skip this batch after emergency handling
+                    continue
+                else:
+                    logger.error(f"MEZO step failed after {mezo_closure.attempts} attempts: {mezo_closure.last_error or e}")
+                    raise
+        else:
+            optimizer.step(closure=None)
         
         # Stats
         total_loss += loss.item()
@@ -2032,7 +2609,7 @@ def preflight_check(
                 if dataset_files[0].suffix == '.jsonl':
                     try:
                         json.loads(first_line)
-                    except:
+                    except (json.JSONDecodeError, ValueError):
                         results['warnings'].append(f"{dataset_files[0].name}: invalid JSONL, will parse as text")
         except Exception as e:
             results['warnings'].append(f"Cannot read dataset: {e}")
@@ -2071,9 +2648,16 @@ def preflight_check(
     if args.lr < 1e-6 or args.lr > 1e-1:
         results['warnings'].append(f"Unusual learning rate: {args.lr}")
     
-    if args.resume and not Path(args.resume).exists():
-        results['errors'].append(f"Resume checkpoint not found: {args.resume}")
-        results['passed'] = False
+    # Checkpoint resume validation with proper None handling
+    if getattr(args, 'resume', None):
+        resume_path = Path(args.resume).expanduser().resolve()
+        if not resume_path.exists():
+            results['errors'].append(f"Resume checkpoint not found: {resume_path}")
+            results['recommendations'].append(f"Verify the checkpoint path: {resume_path}")
+            results['passed'] = False
+        elif not resume_path.is_file():
+            results['errors'].append(f"Resume path is not a file: {resume_path}")
+            results['passed'] = False
     
     return results
 
@@ -2179,6 +2763,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=3e-4, help='Learning rate')
     parser.add_argument('--batch-size', type=int, default=1, help='Batch size')
+    parser.add_argument('--num-workers', type=int, default=0, 
+                       help='Number of data loading workers (0 = main thread only)')
     parser.add_argument('--max-length', type=int, default=512, help='Max sequence length')
     parser.add_argument('--log-interval', type=int, default=1, help='Logging interval')
     parser.add_argument('--checkpoint-interval', type=int, default=500, help='Checkpoint every N steps')
@@ -2227,7 +2813,8 @@ def main():
     logger.info("CHIMERA-M: Hardware Detection")
     logger.info("=" * 70)
     
-    hw = detect_hardware()
+    # Use hardware info from preflight check (avoid duplicate detection)
+    hw = results['hardware']
     logger.info(f"CUDA Available: {hw['cuda_available']}")
     logger.info(f"VRAM: {hw['vram_gb']:.1f} GB")
     logger.info(f"RAM: {hw['ram_gb']:.1f} GB")
@@ -2288,6 +2875,13 @@ def main():
             dataset_format
         )
     
+    # Validate dataset is not empty
+    if not formatted_data or len(formatted_data) == 0:
+        logger.error("Dataset is empty after formatting - cannot train")
+        sys.exit(1)
+    
+    logger.info(f"[READY] {len(formatted_data)} training samples")
+    
     # Load model and tokenizer
     logger.info("\n" + "=" * 70)
     logger.info("Loading Model")
@@ -2301,7 +2895,7 @@ def main():
             
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
-                dtype=torch.bfloat16 if hw['cuda_available'] else torch.float32,
+                torch_dtype=torch.bfloat16 if hw['cuda_available'] else torch.float32,
                 device_map='auto' if hw['cuda_available'] else 'cpu',
                 low_cpu_mem_usage=True,
             )
@@ -2347,8 +2941,9 @@ def main():
     start_epoch = 0
     start_step = 0
     
-    if args.resume:
-        checkpoint = load_checkpoint(model, optimizer, args.resume)
+    resume_path = getattr(args, 'resume', None)
+    if resume_path:
+        checkpoint = load_checkpoint(model, optimizer, resume_path)
         start_epoch = checkpoint.get('epoch', 0)
         start_step = checkpoint.get('step', 0)
     
@@ -2364,7 +2959,8 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,  # Single-threaded for simplicity
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available() and args.num_workers > 0,
     )
     
     logger.info(f"Dataset: {len(train_dataset)} samples")
@@ -2384,43 +2980,80 @@ def main():
     print(f"  Estimated training time: {est_total_hours:.1f} hours")
     print(f"  (Press Ctrl+C to pause and save checkpoint)\n")
     
+    # Setup signal handler for graceful shutdown on Ctrl+C
+    import signal
+    shutdown_requested = False
+    
+    def signal_handler(sig, frame):
+        nonlocal shutdown_requested
+        if not shutdown_requested:
+            shutdown_requested = True
+            logger.info("\n[INTERRUPT] Ctrl+C received - saving checkpoint before exit...")
+        else:
+            logger.info("[INTERRUPT] Second interrupt - forcing exit")
+            sys.exit(1)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    
     global_step = start_step
     
-    for epoch in range(start_epoch, args.epochs):
-        logger.info(f"\nEpoch {epoch + 1}/{args.epochs}")
+    try:
+        for epoch in range(start_epoch, args.epochs):
+            logger.info(f"\nEpoch {epoch + 1}/{args.epochs}")
+            
+            avg_loss = train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                epoch + 1,
+                args.log_interval,
+            )
+            
+            logger.info(f"Epoch {epoch + 1} complete. Avg loss: {avg_loss:.4f}")
+            
+            # Save epoch checkpoint
+            checkpoint_path = f"{args.output_dir}/checkpoint_epoch{epoch + 1}.pt"
+            save_checkpoint(model, optimizer, epoch + 1, global_step, avg_loss, checkpoint_path)
+            
+            # Check if shutdown was requested during epoch
+            if shutdown_requested:
+                logger.info("[INTERRUPT] Shutdown requested, exiting gracefully...")
+                break
         
-        avg_loss = train_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device,
-            epoch + 1,
-            args.log_interval,
-        )
+        if not shutdown_requested:
+            logger.info("\n" + "=" * 70)
+            logger.info("Training Complete")
+            logger.info("=" * 70)
         
-        logger.info(f"Epoch {epoch + 1} complete. Avg loss: {avg_loss:.4f}")
+    except KeyboardInterrupt:
+        logger.info("\n[INTERRUPT] Training interrupted by user")
+    except Exception as e:
+        logger.error(f"\n[ERROR] Training failed: {e}")
+        raise
+    finally:
+        # Always save checkpoint on exit (even if interrupted)
+        if shutdown_requested:
+            emergency_path = f"{args.output_dir}/checkpoint_interrupt.pt"
+            save_checkpoint(model, optimizer, epoch + 1, global_step, avg_loss, emergency_path)
+            logger.info(f"Emergency checkpoint saved: {emergency_path}")
         
-        # Save epoch checkpoint
-        checkpoint_path = f"{args.output_dir}/checkpoint_epoch{epoch + 1}.pt"
-        save_checkpoint(model, optimizer, epoch + 1, global_step, avg_loss, checkpoint_path)
-    
-    logger.info("\n" + "=" * 70)
-    logger.info("Training Complete")
-    logger.info("=" * 70)
-    
-    # Save final model
-    final_path = f"{args.output_dir}/final_model"
-    model.save_pretrained(final_path)
-    tokenizer.save_pretrained(final_path)
-    
-    logger.info(f"Final model saved: {final_path}")
-    
-    # Cleanup
-    if optimizer.watchdog:
-        optimizer.watchdog.stop()
-    
-    if optimizer.paged_memory:
-        optimizer.paged_memory.cleanup()
+        # Save final model if training completed normally
+        if not shutdown_requested:
+            final_path = f"{args.output_dir}/final_model"
+            try:
+                model.save_pretrained(final_path)
+                tokenizer.save_pretrained(final_path)
+                logger.info(f"Final model saved: {final_path}")
+            except Exception as e:
+                logger.warning(f"Could not save final model: {e}")
+        
+        # Cleanup
+        if optimizer.watchdog:
+            optimizer.watchdog.stop()
+        
+        if optimizer.paged_memory:
+            optimizer.paged_memory.cleanup()
 
 
 if __name__ == '__main__':

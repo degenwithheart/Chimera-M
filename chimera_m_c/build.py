@@ -9,8 +9,19 @@ import sys
 import platform
 from pathlib import Path
 
+def find_compiler():
+    """Find available C compiler."""
+    compilers = ['gcc', 'clang', 'cc']
+    for compiler in compilers:
+        try:
+            subprocess.run([compiler, '--version'], capture_output=True, check=True)
+            return compiler
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+    return None
+
 def build_cms():
-    """Build Count-Min Sketch C library."""
+    """Build Count-Min Sketch C library with cross-platform support."""
     print("Building Count-Min Sketch extension...")
     
     src = Path("count_min_sketch.c")
@@ -19,31 +30,50 @@ def build_cms():
         return False
     
     system = platform.system()
+    compiler = find_compiler()
+    
+    if compiler is None:
+        print("  ✗ No C compiler found (tried: gcc, clang, cc)")
+        print("  Please install a C compiler and try again")
+        return False
+    
+    print(f"  Using compiler: {compiler}")
     
     if system == 'Darwin':
         # macOS - build universal binary
         cmd = [
-            'gcc', '-O3', '-shared', '-fPIC',
+            compiler, '-O3', '-shared', '-fPIC',
             '-arch', 'x86_64', '-arch', 'arm64',  # Universal binary
             '-o', 'count_min_sketch.so',
             str(src),
             '-lm'
         ]
-    else:
-        # Linux
+    elif system == 'Windows':
+        # Windows - use .dll extension
         cmd = [
-            'gcc', '-O3', '-shared', '-fPIC',
-            '-march=native',  # Optimize for current CPU
-            '-ffast-math',
+            compiler, '-O3', '-shared',
+            '-o', 'count_min_sketch.dll',
+            str(src)
+        ]
+    else:
+        # Linux and other Unix-like systems
+        cmd = [
+            compiler, '-O3', '-shared', '-fPIC',
             '-o', 'count_min_sketch.so',
             str(src),
             '-lm'
         ]
+        
+        # Add optimizations only for GCC
+        if compiler == 'gcc':
+            cmd.insert(1, '-march=native')
+            cmd.insert(2, '-ffast-math')
     
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
-            print("  ✓ count_min_sketch.so built successfully")
+            lib_name = 'count_min_sketch.dll' if system == 'Windows' else 'count_min_sketch.so'
+            print(f"  ✓ {lib_name} built successfully")
             return True
         else:
             print(f"  ✗ Build failed: {result.stderr}")
